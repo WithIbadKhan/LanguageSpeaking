@@ -11,6 +11,8 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import jwt
 import os
+import io
+from sp_char import special_char
 import random
 import string
 import smtplib
@@ -19,8 +21,7 @@ from email.mime.multipart import MIMEMultipart
 import secrets
 from dotenv import load_dotenv
 from pydub import AudioSegment
-import simpleaudio as sa
-from fastapi.responses import HTMLResponse
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -34,7 +35,7 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 END_OF_MESSAGE_TOKEN = "."
 voice_id = "21m00Tcm4TlvDq8ikWAM"
-context = "You are CEFRL, human assistant For Language Speaking. You are Act like Language Teacher and should question from user to try to understand what is the level of Speaking of User. Your answers should be limited to 1-2 short sentences."
+context = "You are CEFRL, human assistant for language speaking. You act like a language teacher and should question the user to try to understand their level of speaking. Your answers should be limited to 1-2 short sentences."
 # Set your secret keys and configuration settings
 SECRET_KEY = secrets.token_hex(16)
 JWT_SECRET_KEY = secrets.token_hex(16)
@@ -53,7 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = MongoClient(MONGO_URI)
 db = client['chloe']
 user_collection = db['users']
 recovery_collection = db['recovery']
@@ -66,22 +67,14 @@ MAIL_USERNAME = "technologiesoctaloop@gmail.com"
 MAIL_PASSWORD = "vlrv oxym zzdv oavt"
 MAIL_DEFAULT_SENDER = "Octaloop_Tech <technologiesoctaloop@gmail.com>"
 
-# Ensure the files exist
-if not os.path.exists('input_texts.txt'):
-    open('input_texts.txt', 'w').close()
+# Ensure the file exists
+if not os.path.exists('conversation_log.txt'):
+    open('conversation_log.txt', 'w').close()
 
-if not os.path.exists('output_texts.txt'):
-    open('output_texts.txt', 'w').close()
-
-# Write input text to a file
-def write_input_to_file(input_text):
-    with open('input_texts.txt', 'a') as file:
-        file.write(input_text + '\n')
-
-# Write output text to a file
-def write_output_to_file(output_text):
-    with open('output_texts.txt', 'a') as file:
-        file.write(output_text + '\n')
+# Write input and output text to a file
+def write_to_file(role, text):
+    with open('conversation_log.txt', 'a') as file:
+        file.write(f"{role}: {text}\n")
 
 # Pydantic models
 class User(BaseModel):
@@ -142,14 +135,15 @@ def send_recovery_email(email: str, code: str):
 
 def generate_recovery_code() -> str:
     return ''.join(random.choices(string.digits, k=4))
-#Registeration 
+
 @app.post("/register")
 async def register(user: User):
     if user_collection.find_one({"email": user.email}):
-        raise HTTPException(status_code=400, detail="Email already exists")
-    
+        raise HTTPException(status_code=201, detail="Email already exists")
+    user_id = str(uuid.uuid4())
     # Create a dictionary with the required fields
     user_dict = {
+        "user_id": user_id,
         "first_name": user.first_name,
         "last_name": user.last_name,
         "email": user.email,
@@ -158,12 +152,12 @@ async def register(user: User):
     }
 
     user_collection.insert_one(user_dict)
-    return {"message": "User registered successfully"}
+    return {"detail": "User registered successfully","user_id": user_id}
 
 @app.post("/signup")
 async def signup(user: User):
     if user_collection.find_one({"email": user.email}):
-        raise HTTPException(status_code=400, detail="Email already exists")
+        raise HTTPException(status_code=201, detail="Email already exists")
     hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(user.password)
     user_dict = user.dict()
     user_dict["password_hashed"] = hashed_password
@@ -203,7 +197,7 @@ async def verify_recovery_code(recovery: Recovery):
         "timestamp": {"$gte": datetime.utcnow() - timedelta(hours=1)}
     })
     if not recovery_data:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
+        raise HTTPException(status_code=201, detail="Invalid or expired recovery code")
     return {"message": "Recovery code verified successfully"}
 
 @app.post("/reset_password")
@@ -213,25 +207,20 @@ async def reset_password(reset_password_data: ResetPassword):
         raise HTTPException(status_code=404, detail="Email not found")
     recovery_data = db.recovery.find_one({"recovery_code": reset_password_data.code})
     if not recovery_data:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
+        raise HTTPException(status_code=201, detail="Invalid or expired recovery code")
     expiration_time = recovery_data["timestamp"] + timedelta(minutes=5)
     if datetime.utcnow() > expiration_time:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
+        raise HTTPException(status_code=201, detail="Invalid or expired recovery code")
     if reset_password_data.new_password != reset_password_data.confirm_password:
-        raise HTTPException(status_code=400, detail="New password and confirm password do not match")
+        raise HTTPException(status_code=201, detail="New password and confirm password do not match")
     hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(reset_password_data.new_password)
     user_collection.update_one({"_id": user["_id"]}, {"$set": {"password_hashed": hashed_password}})
     db.recovery.delete_one({"_id": recovery_data["_id"]})
     return {"message": "Password successfully reset. You can now log in with your new password."}
 
 @app.websocket("/ws")
-
-
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("Client connected.")
-    await websocket.send_json({"message": "Welcome! You are now connected to the GPT-4 Chatbot."})
-
     try:
         while True:
             message = await websocket.receive_text()
@@ -241,24 +230,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = json.loads(message)
                 user_input = data.get('message')
                 message_id = data.get('id')
-                write_input_to_file(user_input)  # Store user input
+                write_to_file("User", user_input)  # Store user input
                 if user_input.lower() == 'exit':
-                    await websocket.send_json({"message": "Goodbye!"})
+                    await websocket.send_text(json.dumps({"message": "Goodbye!"}))
                     break
                 await stream_response(websocket, user_input, message_id)
             except json.JSONDecodeError as e:
                 print(f"JSON decode error: {e}")
-                await websocket.send_json({"message": "Invalid message format. Please send a JSON object."})
+                await websocket.send_text(json.dumps({"message": "Invalid message format. Please send a JSON object."}))
             except Exception as e:
                 print(f"Error: {e}")
-                await websocket.send_json({"message": "An error occurred while processing your message."})
+                await websocket.send_text(json.dumps({"message": "An error occurred while processing your message."}))
 
     except WebSocketDisconnect:
         print("Client disconnected.")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
-async def stream_response(websocket, prompt, message_id):
+async def stream_response(websocket: WebSocket, prompt, message_id):
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -278,12 +267,12 @@ async def stream_response(websocket, prompt, message_id):
             if response.status != 200:
                 error_message = await response.text()
                 print(f"Request error: {response.status}, {error_message}")
-                await websocket.send_json({"message": "An error occurred while fetching the response from the AI.", "id": message_id})
+                await websocket.send_text(json.dumps({"message": "An error occurred while fetching the response from the AI.", "id": message_id}))
                 return
 
             response_buffer = ""
             async for line in response.content:
-                decoded_line = line.decode('utf-8').strip()  # Remove surrounding whitespace
+                decoded_line = line.decode('utf-8').strip()
                 if not decoded_line:
                     continue
                 if decoded_line.startswith('data: '):
@@ -295,16 +284,22 @@ async def stream_response(websocket, prompt, message_id):
                         if 'choices' in json_data and len(json_data['choices']) > 0:
                             content = json_data['choices'][0]['delta'].get('content', '')
                             if content:
-                                response_buffer += content
-                                await websocket.send_json({"message": content, "id": message_id})
+                                response_buffer += " " + content
+                                await websocket.send_text(json.dumps({"message": content, "id": message_id}))
+                                if content in special_char or response_buffer.count(" ") >= 10:
+                                    audio_base64 = await text_to_speech(response_buffer)
+                                    await websocket.send_text(json.dumps({"audio": audio_base64, "id": message_id}))
+                                    write_to_file("Agent", response_buffer.strip())  # Store agent response
+                                    response_buffer = ""
                     except json.JSONDecodeError as e:
                         print(f"JSON decode error in streaming: {e}")
+            else:
+                audio_base64 = await text_to_speech(response_buffer)
+                await websocket.send_text(json.dumps({"audio": audio_base64, "id": message_id}))
+                write_to_file("Agent", response_buffer.strip())  # Store agent response
 
-    await websocket.send_json({"message": END_OF_MESSAGE_TOKEN, "id": message_id})
-    write_output_to_file(response_buffer)  # Store the AI response
-
-    # Send the full response to Eleven Labs for TTS
-    await text_to_speech(response_buffer)
+    await websocket.send_text(json.dumps({"message": END_OF_MESSAGE_TOKEN, "id": message_id}))
+    write_to_file("Agent", response_buffer.strip())  # Store agent response
 
 async def text_to_speech(text):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream/with-timestamps"
@@ -334,22 +329,15 @@ async def text_to_speech(text):
             audio_bytes_chunk = base64.b64decode(response_dict["audio_base64"])
             audio_bytes += audio_bytes_chunk
 
-    with open('output.mp3', 'wb') as f:
-        f.write(audio_bytes)
+    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+    wav_buffer = io.BytesIO()
+    audio.export(wav_buffer, format="wav")
+    wav_buffer.seek(0)
 
-    # Convert MP3 to WAV
-    audio = AudioSegment.from_mp3('output.mp3')
-    audio.export('output.wav', format='wav')
+    audio_base64 = base64.b64encode(wav_buffer.read()).decode('utf-8')
+    return audio_base64
 
-    play_audio('output.wav')
-
-def play_audio(file_path):
-    wave_obj = sa.WaveObject.from_wave_file(file_path)
-    play_obj = wave_obj.play()
-    play_obj.wait_done()
-
-
-#Port 8000
+# Port 8000
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

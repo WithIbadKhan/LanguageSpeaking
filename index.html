@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
+    <title>WebSocket Chat</title>
+</head>
+<body>
+    <p id="status">Not Connected</p>
+    <p id="transcript"></p>
+    <p id="response"></p>
+    <p id="wpm">WPM: 0</p>
+    <audio id="audioPlayer" style="display:none;"></audio>
+    <script>
+        navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+            console.log({ stream });
+            if (!MediaRecorder.isTypeSupported('audio/webm')) return alert('Browser not supported');
+
+            const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            const deepgramSocket = new WebSocket('wss://api.deepgram.com/v1/listen?punctuate=true', [
+                'token',
+                'c0e5bed0e580961a2e0fbaebe0c0d10921944f97',
+            ]);
+            const clientSocket = new WebSocket('ws://localhost:8000/ws');
+            let lastSentTime = Date.now();
+            let messageBuffer = '';
+            let messageId = 0;
+            let wordCount = 0;
+            let startTime = null;
+
+            deepgramSocket.onopen = () => {
+                document.querySelector('#status').textContent = 'Connected to Deepgram';
+                console.log({ event: 'onopen' });
+
+                mediaRecorder.addEventListener('dataavailable', async (event) => {
+                    if (event.data.size > 0 && deepgramSocket.readyState === WebSocket.OPEN) {
+                        deepgramSocket.send(event.data);
+                    }
+                });
+
+                mediaRecorder.start(1000);
+                startTime = Date.now(); // Start timing when recording starts
+            };
+
+            deepgramSocket.onmessage = (message) => {
+                const received = JSON.parse(message.data);
+                const transcript = received.channel.alternatives[0].transcript;
+                if (transcript && received.is_final) {
+                    console.log(transcript);
+                    document.querySelector('#transcript').textContent += transcript + ' ';
+                    const currentTime = Date.now();
+                    messageBuffer += transcript + ' ';
+                    wordCount += transcript.split(' ').filter(word => word).length; // Count words
+
+                    if (currentTime - lastSentTime >= 3000) {
+                        if (clientSocket.readyState === WebSocket.OPEN) {
+                            messageId++;
+                            const messageToSend = { id: messageId, message: messageBuffer.trim() };
+                            console.log('Sending message to server:', messageToSend);
+                            clientSocket.send(JSON.stringify(messageToSend));
+                            lastSentTime = currentTime;
+                            messageBuffer = '';
+                        }
+                    }
+                    
+                    // Calculate and update WPM
+                    const elapsedTime = (currentTime - startTime) / 60000; // Convert milliseconds to minutes
+                    const wpm = (wordCount / elapsedTime).toFixed(2); // Calculate words per minute
+                    document.querySelector('#wpm').textContent = `WPM: ${wpm}`;
+                }
+            };
+
+            deepgramSocket.onclose = () => {
+                console.log({ event: 'onclose' });
+            };
+
+            deepgramSocket.onerror = (error) => {
+                console.log({ event: 'onerror', error });
+            };
+
+            clientSocket.onopen = () => {
+                console.log('Connected to Python WebSocket client');
+            };
+
+            clientSocket.onmessage = (message) => {
+                const received = JSON.parse(message.data);
+                console.log('Message received from server:', received);
+                if (received.message) {
+                    const responseMessage = received.message;
+                    console.log(responseMessage);
+                    document.querySelector('#response').textContent += responseMessage + ' ';
+                } else if (received.audio) {
+                    const audioBase64 = received.audio;
+                    const audioBlob = base64ToBlob(audioBase64, 'audio/wav');
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    const audioPlayer = document.getElementById('audioPlayer');
+                    audioPlayer.src = audioUrl;
+                    audioPlayer.play();
+                }
+            };
+
+            clientSocket.onclose = () => {
+                console.log('Disconnected from Python WebSocket client');
+            };
+
+            clientSocket.onerror = (error) => {
+                console.log({ event: 'clientSocket onerror', error });
+            };
+
+            setInterval(() => {
+                if (messageBuffer && Date.now() - lastSentTime >= 3000) {
+                    if (clientSocket.readyState === WebSocket.OPEN) {
+                        messageId++;
+                        const messageToSend = { id: messageId, message: messageBuffer.trim() };
+                        console.log('Sending message to server:', messageToSend);
+                        clientSocket.send(JSON.stringify(messageToSend));
+                        lastSentTime = Date.now();
+                        messageBuffer = '';
+                    }
+                }
+            }, 1000);
+
+            function base64ToBlob(base64, mimeType) {
+                const byteCharacters = atob(base64);
+                const byteArrays = [];
+
+                for (let offset = 0; offset < byteCharacters.length; offset += 512) {
+                    const slice = byteCharacters.slice(offset, offset + 512);
+                    const byteNumbers = new Array(slice.length);
+                    for (let i = 0; i < slice.length; i++) {
+                        byteNumbers[i] = slice.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+                    byteArrays.push(byteArray);
+                }
+
+                return new Blob(byteArrays, { type: mimeType });
+            }
+        }).catch((error) => {
+            console.error('Error accessing media devices.', error);
+        });
+    </script>
+</body>
+</html>

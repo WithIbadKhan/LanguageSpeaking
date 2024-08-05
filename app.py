@@ -1,6 +1,7 @@
 import asyncio
 import json
 import aiohttp
+import openai
 import requests
 import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -9,6 +10,7 @@ from pydantic import BaseModel, EmailStr
 from pymongo import MongoClient
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, UploadFile, File
 import jwt
 import os
 import io
@@ -44,6 +46,24 @@ PERMANENT_SESSION_LIFETIME = timedelta(days=2)
 
 # Initialize FastAPI app
 app = FastAPI()
+
+
+def summarize_conversation(prompt: str) -> str:
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are an assistant that summarizes and provides feedback."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -254,7 +274,7 @@ async def stream_response(websocket: WebSocket, prompt, message_id):
         "Content-Type": "application/json"
     }
     data = {
-        "model": "gpt-4",
+        "model": "gpt-4-turbo",
         "messages": [
             {"role": "system", "content": context},
             {"role": "user", "content": prompt}
@@ -336,7 +356,28 @@ async def text_to_speech(text):
 
     audio_base64 = base64.b64encode(wav_buffer.read()).decode('utf-8')
     return audio_base64
+@app.post("/analyze-conversation/")
+async def analyze_conversation(file: UploadFile = File(...)):
+    try:
+        # Read content from the uploaded file
+        content = await file.read()
+        input_content = content.decode('utf-8')
 
+        # Prepare the prompt
+        prompt = f"""{input_content}\n\nYou are an expert language coach. 
+            You will read and analyze a conversation between an agent and 
+            a user from a provided text file. Your task is to identify 
+            any areas where the user may have used incorrect words,
+            had pronunciation issues, listening capability gaps, or lacked
+            fluency. You will provide constructive feedback to the user on
+            these points and give practical tips on how to improve their language skills based on the conversation."""
+
+        # Get response from ChatGPT
+        response = summarize_conversation(prompt)
+
+        return {"feedback": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 # Port 8000
 if __name__ == "__main__":
     import uvicorn

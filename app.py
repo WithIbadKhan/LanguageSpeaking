@@ -1,69 +1,47 @@
+
+#update analyze and cerf_ws
 import asyncio
+import openai
+
 import json
 import aiohttp
-import openai
-import requests
+# from openai import AsyncOpenAI
 import base64
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from pymongo import MongoClient
+from pydantic import BaseModel, EmailStr, Field
+from pydantic_core import core_schema
+from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, UploadFile, File
-import jwt
 import os
 import io
-from sp_char import special_char
-import random
-import string
+from openai import OpenAIError
+from bson import ObjectId
+from typing import List, Optional, Annotated
+from dotenv import load_dotenv
+from pydub import AudioSegment
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import secrets
-from dotenv import load_dotenv
-from pydub import AudioSegment
-import uuid
+import requests
+import traceback
 
 # Load environment variables
-load_dotenv()
-
-DG_API_KEY = os.getenv('DG_API_KEY')
-MAIL_USERNAME = os.getenv('MAIL_USERNAME')
-MAIL_PASSWORD = os.getenv('MAIL_PASSWORD')
+load_dotenv(override=True)
 MONGO_URI = os.getenv('MONGO_URI')
 ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-
+MAIL_USERNAME = os.getenv('MAIL_USERNAME')
+MAIL_PASSWORD = os.getenv('MAIL_PASSWORD')
+openai.api_key = os.getenv('OPENAI_API_KEY')
+# Constants
 END_OF_MESSAGE_TOKEN = "."
-voice_id = "21m00Tcm4TlvDq8ikWAM"
-context = "You are CEFRL, human assistant for language speaking. You act like a language teacher and should question the user to try to understand their level of speaking. Your answers should be limited to 1-2 short sentences."
-# Set your secret keys and configuration settings
-SECRET_KEY = secrets.token_hex(16)
-JWT_SECRET_KEY = secrets.token_hex(16)
-JWT_EXPIRATION_DELTA = timedelta(minutes=60)  # Set your desired expiration time
-PERMANENT_SESSION_LIFETIME = timedelta(days=2)
+VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+CONTEXT = "You are CEFRL, human assistant for language speaking. You act like a language teacher and should question the user to try to understand their level of speaking. Your answers should be limited to 1-2 short sentences."
 
 # Initialize FastAPI app
 app = FastAPI()
-
-
-def summarize_conversation(prompt: str) -> str:
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": "You are an assistant that summarizes and provides feedback."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1000,
-            temperature=0.7
-        )
-        return response.choices[0].message['content'].strip()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 
 # Add CORS middleware
 app.add_middleware(
@@ -74,29 +52,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = MongoClient(MONGO_URI)
-db = client['chloe']
+# MongoDB connection
+client = AsyncIOMotorClient(MONGO_URI)
+db = client['CEFRL']
 user_collection = db['users']
-recovery_collection = db['recovery']
+conversations_collection = db['conversations']
 
-# Email configuration
-MAIL_SERVER = "smtp.gmail.com"
-MAIL_PORT = 465
-MAIL_USE_SSL = True
-MAIL_USERNAME = "technologiesoctaloop@gmail.com"
-MAIL_PASSWORD = "vlrv oxym zzdv oavt"
-MAIL_DEFAULT_SENDER = "Octaloop_Tech <technologiesoctaloop@gmail.com>"
+scores_collection = db['scores']
 
-# Ensure the file exists
-if not os.path.exists('conversation_log.txt'):
-    open('conversation_log.txt', 'w').close()
+# OpenAI client
+# openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Write input and output text to a file
-def write_to_file(role, text):
-    with open('conversation_log.txt', 'a') as file:
-        file.write(f"{role}: {text}\n")
+# Password hashing (still used in case needed for user operations)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class PyObjectId(str):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid ObjectId")
+        return str(v)
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _source_type, _handler):
+        return core_schema.json_or_python_schema(
+            json_schema=core_schema.str_schema(),
+            python_schema=core_schema.union_schema([
+                core_schema.is_instance_schema(ObjectId),
+                core_schema.chain_schema([
+                    core_schema.str_schema(),
+                    core_schema.no_info_plain_validator_function(cls.validate),
+                ]),
+            ]),
+            serialization=core_schema.plain_serializer_function_ser_schema(str),
+        )
+
+PydanticObjectId = Annotated[PyObjectId, Field(default_factory=PyObjectId)]
 
 # Pydantic models
+class UserCreate(BaseModel):
+    first_name: str
+    last_name: str
+    email: EmailStr
+    # password: str
+    language_interface: str
+    language_test: str
+
+class UserUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language_interface: Optional[str] = None
+    language_test: Optional[str] = None
+
 class User(BaseModel):
     first_name: str
     last_name: str
@@ -104,143 +115,121 @@ class User(BaseModel):
     language_interface: str
     language_test: str
 
-class Login(BaseModel):
-    email: EmailStr
-    password: str
-
-class Token(BaseModel):
-    token: str
-    token_timestamp: datetime
-
-class ForgotPassword(BaseModel):
-    email: EmailStr
-
-class Recovery(BaseModel):
-    code: str
-
-class ResetPassword(BaseModel):
-    email: EmailStr
-    code: str
-    new_password: str
-    confirm_password: str
-
-# Helper functions
-def generate_token(email: str) -> str:
-    payload = {
-        "email": email,
-        "exp": datetime.utcnow() + JWT_EXPIRATION_DELTA
+    model_config = {
+        "populate_by_name": True,
+        "json_encoders": {ObjectId: str},
+        "arbitrary_types_allowed": True,
     }
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm="HS256")
 
-def send_recovery_email(email: str, code: str):
-    subject = 'Password Recovery Code'
-    body = f'Your recovery code is: {code}'
-    msg = MIMEMultipart()
-    msg['From'] = MAIL_DEFAULT_SENDER
-    msg['To'] = email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
+class Message(BaseModel):
+    role: str
+    content: str
+
+class Session(BaseModel):
+    messages: List[Message]
+
+class ConversationCreate(BaseModel):
+    user_id: PydanticObjectId
+    session: Session
+
+class Conversation(ConversationCreate):
+    id: PydanticObjectId = Field(alias="_id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {
+        "populate_by_name": True,
+        "json_encoders": {ObjectId: str},
+        "arbitrary_types_allowed": True,
+    }
+
+class ScoreCreate(BaseModel):
+    conversation_id: PydanticObjectId
+    average_score: float
+    fluency: float
+    pronunciation: float
+    listening: float
+
+class Score(ScoreCreate):
+    id: PydanticObjectId = Field(alias="_id")
+
+    model_config = {
+        "populate_by_name": True,
+        "json_encoders": {ObjectId: str},
+        "arbitrary_types_allowed": True,
+    }
+async def summarize_conversation(prompt: str) -> str:
     try:
-        # Connect to SMTP server
-        server = smtplib.SMTP_SSL(MAIL_SERVER, MAIL_PORT) if MAIL_USE_SSL else smtplib.SMTP(MAIL_SERVER, MAIL_PORT)
-        server.connect(MAIL_SERVER, MAIL_PORT)
-        server.ehlo()
-        server.login(MAIL_USERNAME, MAIL_PASSWORD)
-        # Send email
-        server.sendmail(MAIL_DEFAULT_SENDER, email, msg.as_string())
-        server.quit()
-        print(f"Email sent to {email} with recovery code.")
+        # Use the asynchronous OpenAI API method `acreate`
+        print("test")
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are an assistant that summarizes and provides feedback."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        # Properly access the content from the response
+        return response['choices'][0]['message']['content']
+    except openai.error.OpenAIError as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI API error: {e}")
     except Exception as e:
-        print(f"Error sending email: {e}")
-
-def generate_recovery_code() -> str:
-    return ''.join(random.choices(string.digits, k=4))
-
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+# User CRUD operations
 @app.post("/register")
-async def register(user: User):
-    if user_collection.find_one({"email": user.email}):
-        raise HTTPException(status_code=201, detail="Email already exists")
-    user_id = str(uuid.uuid4())
-    # Create a dictionary with the required fields
+async def register(user: UserCreate):
+    if await user_collection.find_one({"email": user.email}):
+        raise HTTPException(status_code=200, detail="Email already exists")
+    
+    # Create the user dictionary without the password
     user_dict = {
-        "user_id": user_id,
         "first_name": user.first_name,
         "last_name": user.last_name,
         "email": user.email,
         "language_interface": user.language_interface,
-        "language_test": user.language_test
+        "language_test": user.language_test,
+        "created_at": datetime.utcnow()
     }
+    
+    # Insert the new user into the database
+    result = await user_collection.insert_one(user_dict)
+    user_id = result.inserted_id
+    
+    return {"detail": "User registered successfully", "user_id": str(user_id)}
 
-    user_collection.insert_one(user_dict)
-    return {"detail": "User registered successfully","user_id": user_id}
+@app.get("/users/{user_id}", response_model=User)
+async def read_user(user_id: str):
+    user = await user_collection.find_one({"_id": ObjectId(user_id)})
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return User(**user)
 
-@app.post("/signup")
-async def signup(user: User):
-    if user_collection.find_one({"email": user.email}):
-        raise HTTPException(status_code=201, detail="Email already exists")
-    hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(user.password)
-    user_dict = user.dict()
-    user_dict["password_hashed"] = hashed_password
-    del user_dict["password"]  
-    user_collection.insert_one(user_dict)
-    return {"message": "User created successfully"}
+@app.put("/users/{user_id}", response_model=User)
+async def update_user(user_id: str, user: UserUpdate):
+    update_data = {k: v for k, v in user.model_dump().items() if v is not None}
+    if len(update_data) == 0:
+        raise HTTPException(status_code=200, detail="No fields to update")
+    result = await user_collection.update_one(
+        {"_id": ObjectId(user_id)}, {"$set": update_data}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    updated_user = await user_collection.find_one({"_id": ObjectId(user_id)})
+    return User(**updated_user)
 
-@app.post("/login")
-async def login(login_data: Login):
-    user = user_collection.find_one({"email": login_data.email})
-    if not user or not CryptContext(schemes=["pbkdf2_sha256"]).verify(login_data.password, user["password_hashed"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = generate_token(login_data.email)
-    token_timestamp = datetime.utcnow() + timedelta(hours=24)
-    user_collection.update_one({"_id": user["_id"]}, {"$set": {"token": token, "token_timestamp": token_timestamp}})
-    return {"token": token, "token_timestamp": token_timestamp}
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: str):
+    result = await user_collection.delete_one({"_id": ObjectId(user_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"detail": "User deleted successfully"}
 
-@app.post("/forgot_password")
-async def forgot_password(forgot_password_data: ForgotPassword):
-    user = user_collection.find_one({"email": forgot_password_data.email})
-    if not user:
-        raise HTTPException(status_code=404, detail="Email not found")
-    code = generate_recovery_code()
-    recovery_data = {
-        "user_id": user["_id"],
-        "recovery_code": code,
-        "timestamp": datetime.utcnow()
-    }
-    db.recovery.insert_one(recovery_data)
-    send_recovery_email(forgot_password_data.email, code)
-    return {"message": "Recovery code sent to your email"}
-
-@app.post("/verify_recovery_code")
-async def verify_recovery_code(recovery: Recovery):
-    recovery_data = db.recovery.find_one({
-        "recovery_code": recovery.code,
-        "timestamp": {"$gte": datetime.utcnow() - timedelta(hours=1)}
-    })
-    if not recovery_data:
-        raise HTTPException(status_code=201, detail="Invalid or expired recovery code")
-    return {"message": "Recovery code verified successfully"}
-
-@app.post("/reset_password")
-async def reset_password(reset_password_data: ResetPassword):
-    user = user_collection.find_one({"email": reset_password_data.email})
-    if not user:
-        raise HTTPException(status_code=404, detail="Email not found")
-    recovery_data = db.recovery.find_one({"recovery_code": reset_password_data.code})
-    if not recovery_data:
-        raise HTTPException(status_code=201, detail="Invalid or expired recovery code")
-    expiration_time = recovery_data["timestamp"] + timedelta(minutes=5)
-    if datetime.utcnow() > expiration_time:
-        raise HTTPException(status_code=201, detail="Invalid or expired recovery code")
-    if reset_password_data.new_password != reset_password_data.confirm_password:
-        raise HTTPException(status_code=201, detail="New password and confirm password do not match")
-    hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(reset_password_data.new_password)
-    user_collection.update_one({"_id": user["_id"]}, {"$set": {"password_hashed": hashed_password}})
-    db.recovery.delete_one({"_id": recovery_data["_id"]})
-    return {"message": "Password successfully reset. You can now log in with your new password."}
-
-@app.websocket("/ws")
+# WebSocket endpoint
+@app.websocket("/cefrl_ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    conversation_id = None
     try:
         while True:
             message = await websocket.receive_text()
@@ -250,24 +239,55 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = json.loads(message)
                 user_input = data.get('message')
                 message_id = data.get('id')
-                write_to_file("User", user_input)  # Store user input
+                user_id = data.get('user_id')
+                session_id = data.get('session_id')
+                print("userid",user_id)
+
+                # Find or create the conversation based on user_id and session_id
+                conversation = await conversations_collection.find_one({
+                    "user_id": ObjectId(user_id),
+                    "session.session_id": session_id
+                })
+
+                if conversation:
+                    conversation_id = conversation["_id"]
+                else:
+                    # If no conversation exists, create a new one
+                    conversation_create = {
+                        "user_id": ObjectId(user_id),
+                        "session": {
+                            "session_id": session_id,
+                            "messages": []
+                        },
+                        "created_at": datetime.utcnow()
+                    }
+                    result = await conversations_collection.insert_one(conversation_create)
+                    conversation_id = result.inserted_id
+                    print("conversation_id",conversation_id)
+                # Store user message in conversation
+                await conversations_collection.update_one(
+                    {"_id": ObjectId(conversation_id)},
+                    {"$push": {"session.messages": {"role": "user", "content": user_input}}}
+                )
+
                 if user_input.lower() == 'exit':
                     await websocket.send_text(json.dumps({"message": "Goodbye!"}))
                     break
-                await stream_response(websocket, user_input, message_id)
+
+                await stream_response(websocket, user_input, message_id, conversation_id)
+
             except json.JSONDecodeError as e:
                 print(f"JSON decode error: {e}")
                 await websocket.send_text(json.dumps({"message": "Invalid message format. Please send a JSON object."}))
             except Exception as e:
                 print(f"Error: {e}")
                 await websocket.send_text(json.dumps({"message": "An error occurred while processing your message."}))
-
     except WebSocketDisconnect:
         print("Client disconnected.")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
-async def stream_response(websocket: WebSocket, prompt, message_id):
+async def stream_response(websocket: WebSocket, prompt, message_id, conversation_id):
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -276,12 +296,11 @@ async def stream_response(websocket: WebSocket, prompt, message_id):
     data = {
         "model": "gpt-4-turbo",
         "messages": [
-            {"role": "system", "content": context},
+            {"role": "system", "content": CONTEXT},
             {"role": "user", "content": prompt}
         ],
         "stream": True
     }
-
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=data) as response:
             if response.status != 200:
@@ -289,7 +308,6 @@ async def stream_response(websocket: WebSocket, prompt, message_id):
                 print(f"Request error: {response.status}, {error_message}")
                 await websocket.send_text(json.dumps({"message": "An error occurred while fetching the response from the AI.", "id": message_id}))
                 return
-
             response_buffer = ""
             async for line in response.content:
                 decoded_line = line.decode('utf-8').strip()
@@ -305,24 +323,35 @@ async def stream_response(websocket: WebSocket, prompt, message_id):
                             content = json_data['choices'][0]['delta'].get('content', '')
                             if content:
                                 response_buffer += " " + content
+                    
+                                print("response buffer  :  ", response_buffer)
                                 await websocket.send_text(json.dumps({"message": content, "id": message_id}))
-                                if content in special_char or response_buffer.count(" ") >= 10:
+                                if content in ['.', '!', '?']:
                                     audio_base64 = await text_to_speech(response_buffer)
                                     await websocket.send_text(json.dumps({"audio": audio_base64, "id": message_id}))
-                                    write_to_file("Agent", response_buffer.strip())  # Store agent response
+                                    # Save ChatGPT response to conversation
+                                    await conversations_collection.update_one(
+                                        {"_id": ObjectId(conversation_id)},
+                                        {"$push": {"session.messages": {"role": "assistant", "content": response_buffer.strip()}}}
+                                    )
                                     response_buffer = ""
+
                     except json.JSONDecodeError as e:
                         print(f"JSON decode error in streaming: {e}")
             else:
-                audio_base64 = await text_to_speech(response_buffer)
-                await websocket.send_text(json.dumps({"audio": audio_base64, "id": message_id}))
-                write_to_file("Agent", response_buffer.strip())  # Store agent response
+                if response_buffer:
+                    audio_base64 = await text_to_speech(response_buffer)
+                    await websocket.send_text(json.dumps({"audio": audio_base64, "id": message_id}))
+                    # Save the final ChatGPT response to conversation
+                    await conversations_collection.update_one(
+                        {"_id": ObjectId(conversation_id)},
+                        {"$push": {"session.messages": {"role": "assistant", "content": response_buffer.strip()}}}
+                    )
 
     await websocket.send_text(json.dumps({"message": END_OF_MESSAGE_TOKEN, "id": message_id}))
-    write_to_file("Agent", response_buffer.strip())  # Store agent response
 
 async def text_to_speech(text):
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream/with-timestamps"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream/with-timestamps"
     headers = {
         "Content-Type": "application/json",
         "xi-api-key": ELEVENLABS_API_KEY
@@ -335,12 +364,10 @@ async def text_to_speech(text):
             "similarity_boost": 0.75
         }
     }
-
     response = requests.post(url, json=data, headers=headers, stream=True)
     if response.status_code != 200:
         print(f"Error encountered, status: {response.status_code}, content: {response.text}")
         return
-
     audio_bytes = b""
     for line in response.iter_lines():
         if line:
@@ -348,37 +375,113 @@ async def text_to_speech(text):
             response_dict = json.loads(json_string)
             audio_bytes_chunk = base64.b64decode(response_dict["audio_base64"])
             audio_bytes += audio_bytes_chunk
-
     audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
     wav_buffer = io.BytesIO()
     audio.export(wav_buffer, format="wav")
     wav_buffer.seek(0)
-
     audio_base64 = base64.b64encode(wav_buffer.read()).decode('utf-8')
     return audio_base64
-@app.post("/analyze-conversation/")
-async def analyze_conversation(file: UploadFile = File(...)):
-    try:
-        # Read content from the uploaded file
-        content = await file.read()
-        input_content = content.decode('utf-8')
 
-        # Prepare the prompt
-        prompt = f"""{input_content}\n\nYou are an expert language coach. 
-            You will read and analyze a conversation between an agent and 
-            a user from a provided text file. Your task is to identify 
-            any areas where the user may have used incorrect words,
-            had pronunciation issues, listening capability gaps, or lacked
-            fluency. You will provide constructive feedback to the user on
-            these points and give practical tips on how to improve their language skills based on the conversation."""
+
+@app.get("/analyze-conversation/")
+async def analyze_conversation(user_id: str):
+    try:
+        # Your code logic here...
+        # Convert user_id to ObjectId
+        try:
+            user_object_id = ObjectId(user_id)
+        except Exception as e:
+            raise HTTPException(status_code=200, detail=f"Invalid user_id format: {e}")
+
+        # Query the conversation collection to find all messages for the given user_id
+        conversation = await conversations_collection.find_one({
+            "user_id": user_object_id
+        })
+
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+
+        # Extract messages from the session safely
+        messages = conversation.get("session", {}).get("messages", [])
+        if not messages:
+            raise HTTPException(status_code=404, detail="No messages found in the conversation.")
+
+        # Construct input content for analysis
+        input_content = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
+        print("input", input_content)
+        # Prepare the prompt for ChatGPT
+        prompt = f"""{input_content}
+
+You are an expert language coach. Your task is to analyze the conversation above between a language learner and an agent. Focus on identifying any areas where the user:
+1. Used incorrect words.
+2. Showed gaps in understanding.
+3. Lacked fluency.
+
+Provide constructive feedback on these points and offer practical tips to improve their language skills. If the conversation contains no meaningful content or text, assign a score of 0 for all categories and suggest that the user try again.
+
+Output Format:
+The response should be in JSON format:
+{{
+  "Summary": "Provide a concise summary of the conversation, including all feedback and improvement tips.",
+  "Pronunciation": float,
+  "Listening Comprehension": float,
+  "Fluency": float,
+  "Overall Score": "Grade (A1, A, B, C)"
+}}
+
+Scoring Guidelines:
+- A1: 90-100%
+- A: 75-89%
+- B: 50-74%
+- C: below 50%"""
+
 
         # Get response from ChatGPT
-        response = summarize_conversation(prompt)
-
-        return {"feedback": response}
+        response = await summarize_conversation(prompt)
+        
+        # Assuming response is returned as a JSON string, parse it into a dictionary
+        json_response = json.loads(response)
+        
+        # Return the parsed JSON object
+        return json_response
+    except HTTPException as e:
+        raise e  # Re-raise caught HTTP exceptions to return them to the client
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-# Port 8000
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+    
+
+@app.get("/users/{user_id}/messages")
+async def get_user_messages(user_id: str):
+    try:
+        # Convert user_id to ObjectId
+        try:
+            user_object_id = ObjectId(user_id)
+        except Exception as e:
+            raise HTTPException(status_code=200, detail=f"Invalid user_id format: {e}")
+
+        # Query the conversation collection to find all conversations for the given user_id
+        conversations = await conversations_collection.find({"user_id": user_object_id}).to_list(length=None)
+
+        if not conversations:
+            raise HTTPException(status_code=404, detail="No conversations found for the given user_id.")
+
+        # Extract all messages from all conversations
+        all_messages = []
+        for conversation in conversations:
+            session = conversation.get("session", {})
+            messages = session.get("messages", [])
+            all_messages.extend(messages)
+
+        if not all_messages:
+            raise HTTPException(status_code=404, detail="No messages found in the conversations.")
+
+        return {"user_id": user_id, "messages": all_messages}
+    
+    except HTTPException as e:
+        raise e  # Re-raise caught HTTP exceptions to return them to the client
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

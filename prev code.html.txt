@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebSocket Chat</title>
+    <style>
+      body {
+        font-family: Inter, sans-serif;
+        font-size: 15.297px;
+        font-style: normal;
+        font-weight: 400;
+        margin: 0;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      #chatContainer {
+        width: 100%;
+        max-width: 800px;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .message {
+        margin: 5px 0;
+        padding: 10px;
+        border-radius: 8px;
+      }
+
+      .transcript {
+        color: #000;
+        align-self: flex-start;
+        border-radius: 7.649px 7.649px 5.068px 0;
+        background: rgba(48, 78, 141, 0.1);
+      }
+
+      .response {
+        color: #fff;
+        align-self: flex-end;
+        border-radius: 7.649px 7.649px 0 7.649px;
+        background: #2183c6;
+        margin-right: 10px;
+      }
+
+      #muteButton {
+        margin-top: 20px;
+        padding: 10px 20px;
+        background-color: #2183c6;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="status" style="text-align: center">Not Connected</div>
+    <div id="chatContainer">
+      <!-- Messages will be appended here -->
+    </div>
+    <audio id="audioPlayer" style="display: none"></audio>
+    <!-- Hidden input to trigger Bubble event -->
+    <input type="hidden" id="triggerBubbleEvent" value="0" />
+    <input type="hidden" id="currentTranscript" value="" />
+    <!-- Mute/Unmute buttons -->
+    <button id="muteButton" style="display: none">Mute Mic</button>
+    <button id="muteSpeakerButton" style="display: none">Mute Speaker</button>
+    <button id="unmuteSpeakerButton" style="display: none">
+      Unmute Speaker
+    </button>
+
+    <script>
+      // Function to extract user_id, session_id, and name from the URL query string
+      function getParameterByName(name) {
+        const urlParams = new URLSearchParams(window.location.search);
+        return urlParams.get(name);
+      }
+
+      // Map full language names to their short codes
+      function getLanguageShortCode(language) {
+        const languageMap = {
+          English: "en",
+          French: "fr",
+        };
+        return languageMap[language] || language;
+      }
+
+      // Retrieve user_id, session_id, and name from the query string
+      const userId = getParameterByName("user_id");
+      const sessionId = getParameterByName("session_id");
+      const userName = getParameterByName("name");
+      const languagetest = getParameterByName("language_test");
+      const interface = getParameterByName("interface_lang");
+      const countdownValue = getParameterByName("countdown");
+
+      if (userId) {
+        console.log("User ID retrieved from URL:", userId);
+      } else {
+        console.error("User ID not found in URL");
+      }
+
+      if (sessionId) {
+        console.log("Session ID retrieved from URL:", sessionId);
+      } else {
+        console.error("Session ID not found in URL");
+      }
+
+      if (userName) {
+        console.log("User Name retrieved from URL:", userName);
+      } else {
+        console.error("User Name not found in URL");
+      }
+      if (countdownValue) {
+        console.log("coutdown retrieved from URL:", countdownValue);
+      } else {
+        console.error("countdown not found in URL");
+      }
+
+      if (interface) {
+        console.log("Interface Langugae retrieved from URL:", interface);
+      } else {
+        console.error("Interface Langugae not found in URL");
+      }
+
+      if (languagetest) {
+        console.log("Language to test retrieved from URL:", languagetest);
+      } else {
+        console.error("Language test not found in URL");
+      }
+      // Convert full language name to short code
+      const languageCode = getLanguageShortCode(languagetest);
+
+      console.log("Language code to send:", languageCode);
+
+      let deepgramSocket;
+      let mediaRecorder;
+      let isMuted = false;
+      let isSpeakerMuted = false; // Track speaker mute status
+      let heartbeatInterval;
+      const audioQueue = []; // Queue to store incoming audio chunks
+      let isPlaying = false; // Track if audio is currently playing
+      let audioContext; // AudioContext to manage audio playback
+      let gainNode; // GainNode to control speaker volume
+      let base64Audio = ""; // addddddddd
+
+      // addddddd Utility function to convert Blob to Base64
+      function blobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result.split(",")[1]); // Strip out the "data:audio/wav;base64," prefix
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      }
+
+      function createDeepgramSocket() {
+        deepgramSocket = new WebSocket(
+          `wss://api.deepgram.com/v1/listen?punctuate=true&vad_events=true&stream=true&smart_format=true&utterance_end_ms=1500&interim_results=true&language=${languageCode}`,
+          ["token", "f0b9e93ea008ac588ff38c715cbf2de0524eb3fe"]
+        );
+
+        deepgramSocket.onopen = () => {
+          console.log("Value of Mic Mute", isMuted);
+          document.querySelector("#status").textContent = "Connected";
+          console.log({ event: "onopen" });
+
+          // Send the language test value after connection
+          if (languagetest) {
+            deepgramSocket.send(
+              JSON.stringify({ type: "language", value: languagetest })
+            );
+            console.log("Sent language test value to Deepgram:", languagetest);
+          } else {
+            console.error("Language test value not found");
+          }
+
+          // Trigger Bubble event to start the timer
+          document.querySelector("#triggerBubbleEvent").value = "1";
+          document
+            .querySelector("#triggerBubbleEvent")
+            .dispatchEvent(new Event("change"));
+
+          startHeartbeat(); // Start the heartbeat to keep the connection alive
+
+          startMediaRecorder(); // Start the media recorder
+        };
+
+        deepgramSocket.onmessage = (message) => {
+          try {
+            const received = JSON.parse(message.data);
+            const transcript = received?.channel?.alternatives?.[0]?.transcript;
+
+            if (transcript && received.is_final) {
+              console.log(transcript);
+
+              // Update the hidden input and trigger the event
+              updateBubbleTextElement(transcript);
+              appendMessage("transcript", transcript);
+
+              const currentTime = Date.now();
+              messageBuffer += transcript + " ";
+              totalWordCount += transcript
+                .split(" ")
+                .filter((word) => word).length; // Count words
+
+              if (!isVoiceActive) {
+                voiceStartTime = currentTime; // Set voice start time when first voice is detected
+                isVoiceActive = true;
+              }
+
+              if (isVoiceActive) {
+                // If the voice was active, add the duration since last start time to totalVoiceTime
+                totalVoiceTime += (currentTime - voiceStartTime) / 1000;
+                voiceStartTime = currentTime; // Reset start time to current time
+              }
+
+              lastSentTime = currentTime; // Update the last sent time
+
+              if (clientSocket.readyState === WebSocket.OPEN) {
+                messageId++;
+                const messageToSend = {
+                  id: messageId,
+                  user_id: userId,
+                  session_id: sessionId,
+                  name: userName,
+                  language_test: languagetest,
+                  interface_lang: interface,
+                  message: messageBuffer.trim(),
+                  voice: base64Audio, //addddddddddddd
+                };
+                console.log("Sending message to server:", messageToSend);
+                clientSocket.send(JSON.stringify(messageToSend));
+                messageBuffer = "";
+              }
+
+              // Reset current response container for new voice input
+              currentResponseContainer = null;
+            }
+          } catch (error) {
+            console.error("Error processing message:", error);
+          }
+        };
+
+        deepgramSocket.onclose = () => {
+          try {
+            stopHeartbeat();
+            if (mediaRecorder && mediaRecorder.stream) {
+              mediaRecorder.stream.getTracks().forEach((track) => track.stop());
+            }
+            // STOP MEDIA RECORDER
+            if (mediaRecorder) {
+              mediaRecorder.stop();
+              mediaRecorder = null; // Important to clear the old instance
+            }
+
+            console.log({ event: "onclose" });
+            setTimeout(() => {
+              console.log("Attempting to reconnect...");
+              createDeepgramSocket();
+            }, 1000);
+          } catch (error) {
+            console.error("Error during socket close:", error);
+          }
+        };
+        deepgramSocket.onerror = (error) => {
+          console.error("WebSocket Error", error);
+        };
+      }
+
+      function initializeAudioContext() {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext ||
+            window.webkitAudioContext)();
+          gainNode = audioContext.createGain(); // Create a GainNode for controlling volume
+          gainNode.connect(audioContext.destination);
+          console.log("AudioContext initialized");
+        }
+      }
+
+      function startMediaRecorder() {
+        navigator.mediaDevices
+          .getUserMedia({ audio: true })
+          .then((stream) => {
+            let mimeType;
+            if (MediaRecorder.isTypeSupported("audio/webm")) {
+              mimeType = "audio/webm";
+            } else if (MediaRecorder.isTypeSupported("audio/ogg")) {
+              mimeType = "audio/ogg";
+            } else if (MediaRecorder.isTypeSupported("audio/mp4")) {
+              mimeType = "audio/mp4";
+            } else {
+              return alert(
+                "No supported audio formats found for recording in this browser."
+              );
+            }
+
+            mediaRecorder = new MediaRecorder(stream, {
+              mimeType: mimeType,
+            });
+
+            mediaRecorder.addEventListener("dataavailable", async (event) => {
+              if (
+                event.data.size > 0 &&
+                isMuted === false &&
+                deepgramSocket.readyState === WebSocket.OPEN
+              ) {
+                deepgramSocket.send(event.data);
+                base64Audio = await blobToBase64(event.data); //adddddddd
+              }
+
+              if (mediaRecorder.state === "paused") {
+                mediaRecorder.resume();
+              } else if (mediaRecorder.state === "inactive") {
+                mediaRecorder.start(250);
+              }
+            });
+
+            mediaRecorder.start(250);
+            overallStartTime = Date.now(); // Overall start time
+            const startTimeElement = document.querySelector("#startTime");
+            if (startTimeElement) {
+              startTimeElement.textContent = `Start Time: ${new Date(
+                overallStartTime
+              ).toLocaleTimeString()}`;
+            }
+          })
+          .catch((error) => {
+            console.error("Error accessing media devices.", error);
+            // Attempt to restart media recorder on error
+            setTimeout(startMediaRecorder, 100);
+          });
+      }
+
+      createDeepgramSocket();
+
+      const clientSocket = new WebSocket(
+        `wss://cefrl.octalooptechnologies.com/ws/${userId}/${userName}/${languageCode}`
+      );
+
+      // Function to start sending heartbeat messages to keep the connection alive
+      function startHeartbeat() {
+        heartbeatInterval = setInterval(() => {
+          if (deepgramSocket.readyState === WebSocket.OPEN) {
+            deepgramSocket.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 5000); // Send a ping every 5 seconds
+      }
+
+      // Function to stop sending heartbeat messages
+      function stopHeartbeat() {
+        clearInterval(heartbeatInterval);
+      }
+
+      let lastSentTime = Date.now();
+      let messageBuffer = "";
+      let messageId = 0;
+      let totalWordCount = 0;
+      let voiceStartTime = null;
+      let totalVoiceTime = 0;
+      let overallStartTime = null;
+      let overallEndTime = null;
+      let isVoiceActive = false;
+      let currentResponseContainer = null;
+      const chatContainer = document.getElementById("chatContainer");
+
+      // Function to update the Bubble.io text element
+      function updateBubbleTextElement(transcript) {
+        const transcriptInput = document.getElementById("currentTranscript");
+        transcriptInput.value = transcript;
+
+        // Manually trigger input event to ensure Bubble workflow detects the change
+        var event = new Event("input", {
+          bubbles: true,
+          cancelable: true,
+        });
+        transcriptInput.dispatchEvent(event);
+      }
+
+      // Event listener to handle changes in the currentTranscript input
+      document
+        .getElementById("currentTranscript")
+        .addEventListener("input", (event) => {
+          const transcript = event.target.value;
+          console.log("Transcript updated: ", transcript);
+          // Additional logic if needed
+        });
+
+      clientSocket.onopen = () => {
+        if (userId && sessionId && userName) {
+          const initialMessage = JSON.stringify({
+            type: "init",
+            user_id: userId,
+            session_id: sessionId,
+            name: userName,
+            language_test: languagetest,
+            interface_lang: interface,
+          });
+          clientSocket.send(initialMessage);
+          console.log(
+            "WebSocket connection established and user_id/session_id/name/language_test sent:",
+            userId,
+            sessionId,
+            userName,
+            languagetest,
+            interface
+          );
+        }
+      };
+
+      clientSocket.onmessage = async (message) => {
+        const received = JSON.parse(message.data);
+        console.log("Message received from server:", received);
+
+        if (received.event === "greeting") {
+          const responseMessage = received.text;
+          console.log(responseMessage);
+          appendResponse(responseMessage);
+
+          const audioBase64 = received.audio;
+          const audioBlob = base64ToBlob(audioBase64, "audio/wav");
+          const audioUrl = URL.createObjectURL(audioBlob);
+          audioQueue.push(audioUrl);
+          if (!isPlaying) {
+            playAudioQueue();
+          }
+        } else if (received.message) {
+          const responseMessage = received.message;
+          console.log(responseMessage);
+          appendResponse(responseMessage);
+        } else if (received.audio) {
+          const audioBase64 = received.audio;
+          const audioBlob = base64ToBlob(audioBase64, "audio/wav");
+          const audioUrl = URL.createObjectURL(audioBlob);
+          audioQueue.push(audioUrl);
+          if (!isPlaying) {
+            playAudioQueue();
+          }
+        }
+      };
+
+      async function playAudioQueue() {
+        isPlaying = true;
+        initializeAudioContext(); // Initialize AudioContext when starting to play audio
+        while (audioQueue.length > 0) {
+          const audioUrl = audioQueue.shift();
+          await playAudioChunk(audioUrl);
+        }
+        isPlaying = false;
+      }
+
+      async function playAudioChunk(audioUrl) {
+        return new Promise((resolve) => {
+          fetch(audioUrl)
+            .then((response) => response.arrayBuffer())
+            .then((arrayBuffer) => audioContext.decodeAudioData(arrayBuffer))
+            .then((audioBuffer) => {
+              const source = audioContext.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(gainNode); // Connect source to gainNode
+              source.onended = resolve;
+              source.start(0);
+            })
+            .catch((error) => {
+              console.error("Error playing audio chunk:", error);
+              resolve(); // Continue to the next audio chunk even if there's an error
+            });
+        });
+      }
+
+      clientSocket.onclose = () => {
+        console.log("Disconnected from Python WebSocket client");
+        if (audioQueue.length > 0) {
+          playAudioQueue(); // Ensure that any remaining audio chunks are played
+        }
+      };
+
+      clientSocket.onerror = (error) => {
+        console.error("Client WebSocket Error", error);
+      };
+
+      setInterval(() => {
+        if (messageBuffer && Date.now() - lastSentTime >= 3000) {
+          if (clientSocket.readyState === WebSocket.OPEN) {
+            messageId++;
+            const messageToSend = {
+              id: messageId,
+              user_id: userId,
+              session_id: sessionId,
+              name: userName,
+              language_test: languagetest,
+              interface_lang: interface,
+              message: messageBuffer.trim(),
+            };
+            console.log("Sending message to server:", messageToSend);
+            clientSocket.send(JSON.stringify(messageToSend));
+            lastSentTime = Date.now();
+            messageBuffer = "";
+          }
+        }
+      }, 1000);
+
+      function base64ToBlob(base64, mimeType) {
+        const byteCharacters = atob(base64);
+        const byteArrays = [];
+
+        for (let offset = 0; offset < byteCharacters.length; offset += 512) {
+          const slice = byteCharacters.slice(offset, offset + 512);
+          const byteNumbers = new Array(slice.length);
+
+          for (let i = 0; i < slice.length; i++) {
+            byteNumbers[i] = slice.charCodeAt(i);
+          }
+
+          const byteArray = new Uint8Array(byteNumbers);
+          byteArrays.push(byteArray);
+        }
+
+        return new Blob(byteArrays, { type: mimeType });
+      }
+
+      function appendMessage(type, message) {
+        const messageElement = document.createElement("div");
+        messageElement.className = `message ${type}`;
+        messageElement.textContent = message;
+        chatContainer.appendChild(messageElement);
+        chatContainer.scrollTop = chatContainer.scrollHeight; // Scroll to the bottom
+      }
+
+      function appendResponse(message) {
+        if (!currentResponseContainer) {
+          currentResponseContainer = document.createElement("div");
+          currentResponseContainer.className = "message response";
+          chatContainer.appendChild(currentResponseContainer);
+        }
+
+        currentResponseContainer.textContent += message;
+        chatContainer.scrollTop = chatContainer.scrollHeight; // Scroll to the bottom
+      }
+
+      // Mute/Unmute Button logic
+      document
+        .getElementById("muteButton")
+        .addEventListener("click", toggleMute);
+
+      document
+        .getElementById("muteSpeakerButton")
+        .addEventListener("click", muteSpeaker);
+
+      document
+        .getElementById("unmuteSpeakerButton")
+        .addEventListener("click", unmuteSpeaker);
+
+      // Function to handle mute/unmute mic
+      function toggleMute() {
+        const muteButton = document.getElementById("muteButton");
+
+        if (!muteButton) {
+          console.error("Mute button element not found");
+          return; // Exit the function if the element is not found
+        }
+
+        if (isMuted) {
+          unmuteMic(); // Unmute mic
+        } else {
+          muteMic(); // Mute mic
+        }
+      }
+
+      function muteMic() {
+        if (mediaRecorder && mediaRecorder.state === "recording") {
+          mediaRecorder.pause(); // Mute
+        }
+        isMuted = true;
+        document.getElementById("muteButton").textContent = "Unmute Mic";
+
+        // Mute speaker when mic is muted
+        muteSpeaker();
+
+        // Optionally, send a message to pause processing on the server side
+        if (deepgramSocket.readyState === WebSocket.OPEN) {
+          deepgramSocket.send(JSON.stringify({ type: "pause" }));
+        }
+        startHeartbeat(); // Ensure heartbeat continues even when muted
+      }
+
+      function unmuteMic() {
+        if (!mediaRecorder || mediaRecorder.state === "inactive") {
+          // If the mediaRecorder is inactive, restart it
+          startMediaRecorder();
+        } else if (mediaRecorder.state === "paused") {
+          mediaRecorder.resume(); // Unmute
+        }
+
+        isMuted = false;
+        document.getElementById("muteButton").textContent = "Mute Mic";
+
+        // Unmute speaker when mic is unmuted
+        unmuteSpeaker();
+
+        // Optionally, send a message to resume processing on the server side
+        if (deepgramSocket.readyState === WebSocket.OPEN) {
+          deepgramSocket.send(JSON.stringify({ type: "resume" }));
+        }
+      }
+
+      // Function to handle mute/unmute speaker
+      function muteSpeaker() {
+        if (gainNode) {
+          gainNode.gain.value = 0; // Mute the audio by setting gain to 0
+        }
+        isSpeakerMuted = true;
+        console.log("Speaker muted");
+      }
+
+      function unmuteSpeaker() {
+        if (gainNode) {
+          gainNode.gain.value = 1; // Unmute the audio by restoring gain
+        }
+        isSpeakerMuted = false;
+        console.log("Speaker unmuted");
+      }
+
+      // Expose mute/unmute functions globally
+      window.muteMic = muteMic;
+      window.unmuteMic = unmuteMic;
+      window.muteSpeaker = muteSpeaker;
+      window.unmuteSpeaker = unmuteSpeaker;
+
+      // Ensure audio context is initialized on first user interaction
+      document.body.addEventListener("click", initializeAudioContext, {
+        once: true,
+      });
+      document.body.addEventListener("touchstart", initializeAudioContext, {
+        once: true,
+      });
+
+      // Resume AudioContext on visibility change
+      document.addEventListener("visibilitychange", () => {
+        if (
+          document.visibilityState === "visible" &&
+          audioContext.state === "suspended"
+        ) {
+          audioContext
+            .resume()
+            .then(() => {
+              console.log("AudioContext resumed on visibility change");
+            })
+            .catch((error) => {
+              console.error("Error resuming AudioContext:", error);
+            });
+        }
+      });
+    </script>
+  </body>
+</html>
